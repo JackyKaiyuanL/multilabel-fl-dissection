@@ -2,7 +2,7 @@
 'on single-label tasks these mechanisms cluster' claim with actual numbers.
 Reads experiments/full/results_{cifar,cifar100}_a{0.1,0.5}.json (committed) and emits
 a compact CIFAR-10/100 table. Last-10-round mean, 3 seeds, mean+-pstd.
-    python aggregate_sl.py
+    python -m experiments.aggregate_sl   # -> experiments/tables/table_sl.tex
 """
 import json, os, statistics
 
@@ -50,6 +50,7 @@ for disp, key in ROWS:
 lines += [r"\bottomrule", r"\end{tabular}", r"\end{table}"]
 out = "\n".join(lines)
 print(out)
-open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
-                  "table_sl.tex"), "w").write(out + "\n")
+OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tables")
+os.makedirs(OUT, exist_ok=True)
+open(os.path.join(OUT, "table_sl.tex"), "w").write(out + "\n")
 print("\nAGG_SL_DONE")

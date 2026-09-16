@@ -1,0 +1,7 @@
+[cnx_lr voc0.1 s0] FedAvg@lr0.003         last10 mAP=60.79 (14.8 min)
+[cnx_lr voc0.1 s0] BalBCE@lr0.003         last10 mAP=79.92 (17.9 min)
+[cnx_lr voc0.1 s0] FedAvg@lr0.001         last10 mAP=31.97 (13.7 min)
+[cnx_lr voc0.1 s0] BalBCE@lr0.001         last10 mAP=73.19 (18.0 min)
+[cnx_lr voc0.1 s0] FedAvg@lr0.01          last10 mAP=77.04 (13.9 min)
+[cnx_lr voc0.1 s0] BalBCE@lr0.01          last10 mAP=82.96 (18.2 min)
+REVISION_GROUP_DONE cnx_lr

@@ -5,22 +5,18 @@ Dir(0.1) and Dir(0.5), 3 seeds. If FedMLP-bal climbs from FedMLP's ~14/61 to the
 BalBCE/FedND level (~36/69), balancing is the lever AND is orthogonal/compatible with
 FedMLP's teacher-consistency machinery -- a stronger, more honest story than a head-to-head.
 
-Writes results to results_b2/ (shipped with this artifact).
-    PYTHONPATH=. python -m experiments.b2_orthogonality
+Writes experiments/full/results_b2/results_pt_*.json (read by aggregate_rev.py).
+    python -m experiments.b2_orthogonality
 """
 import json, os, sys, statistics
-# Make this artifact's own package win over any like-named package already on the path,
-# while keeping cwd as the data root so data.py's relative "./data" still resolves.
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))   # repo root
 import torch; torch.set_num_threads(int(os.environ.get("TORCH_THREADS", "6")))
 import fedprior
-_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-assert os.path.abspath(fedprior.__file__).startswith(_root), f"wrong fedprior: {fedprior.__file__}"
 from fedprior.algorithms import METHODS, federated
 from experiments.pretrained_gate import _cfg, _build, ROUNDS
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-OUT = os.path.join(HERE, "..", "results_b2")
+OUT = os.path.join(HERE, "full", "results_b2")
 os.makedirs(OUT, exist_ok=True)
 CONFIGS = [("voc", 0.1), ("voc", 0.5), ("coco", 0.1), ("coco", 0.5)]
 SEEDS = (0, 1, 2)

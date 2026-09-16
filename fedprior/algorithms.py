@@ -76,6 +76,10 @@ class MethodSpec:
     balanced_bce: bool = False       # ablation: class-balanced BCE (pos/neg normalized apart)
     neg_distill: bool = False        # ablation: + per-class KL distillation of negatives
     flag: bool = False               # FLAG: label-adaptive per-class head aggregation
+    loss: str = "bce"                # multi-label base loss (weighting axis): bce|bal|focal|asl|db|wbce
+    full_distill: bool = False       # + all-class binary KL toward the global teacher (plain KD)
+    loss_reduction: str = "sum"      # focal/ASL/DB: "sum" = class-sum/batch-mean (reference code),
+                                     #               "mean" = entry-mean (same scale as BCE)
     excludes_stragglers: bool = True  # FedAvg drops stragglers; others run partial
 
 
@@ -116,11 +120,32 @@ METHODS = {
     # FedMLP (Liu et al., MICCAI 2024): global-teacher consistency + pseudo-label
     # tagging of high-confidence classes (our compact reimplementation).
     "FedMLP": MethodSpec("FedMLP", prior=True, fedmlp=True, eta=1.0),
-    # B2 orthogonality check: add class-balanced BCE to the dedicated method FedMLP.
-    # If FedMLP-bal converges to the BalBCE/FedND level, balancing is the lever AND
-    # it is orthogonal/compatible with FedMLP's teacher-consistency mechanism.
-    "FedMLP-bal": MethodSpec("FedMLP-bal", prior=True, fedmlp=True, eta=1.0,
-                             balanced_bce=True),
+    # ---- AGCS camera-ready revision: widen both axes of the dissection ----
+    # Weighting axis: established imbalance-aware multi-label objectives (no teacher).
+    "FocalBCE":  MethodSpec("FocalBCE", loss="focal"),      # Lin et al. 2017, gamma=2
+    "ASL":       MethodSpec("ASL", loss="asl"),             # Ridnik et al. 2021, g+=0, g-=4, m=0.05
+    "DBLoss":    MethodSpec("DBLoss", loss="db"),           # Wu et al. 2020 (re-balanced + NTR + focal)
+    "WBCE":      MethodSpec("WBCE", loss="wbce"),           # per-class pos_weight BCE (local freq.)
+    # ... each with the SAME negative distillation as FedND (distillation axis under other balancers)
+    "Focal+ND":  MethodSpec("Focal+ND", prior=True, loss="focal", neg_distill=True, eta=1.0),
+    # entry-mean variants (loss scale matched to BCE, so the shared LR grid applies as-is)
+    "FocalBCE-m": MethodSpec("FocalBCE-m", loss="focal", loss_reduction="mean"),
+    "ASL-m":      MethodSpec("ASL-m", loss="asl", loss_reduction="mean"),
+    "DBLoss-m":   MethodSpec("DBLoss-m", loss="db", loss_reduction="mean"),
+    "Focal-m+ND": MethodSpec("Focal-m+ND", prior=True, loss="focal", loss_reduction="mean",
+                             neg_distill=True, eta=1.0),
+    "ASL-m+ND":   MethodSpec("ASL-m+ND", prior=True, loss="asl", loss_reduction="mean",
+                             neg_distill=True, eta=1.0),
+    "ASL+ND":    MethodSpec("ASL+ND", prior=True, loss="asl", neg_distill=True, eta=1.0),
+    # Distillation axis on top of balanced BCE: alternative output-space formulations.
+    "BalBCE+KD":    MethodSpec("BalBCE+KD", prior=True, balanced_bce=True, full_distill=True, eta=1.0),
+    "FedPrior-bal": MethodSpec("FedPrior-bal", prior=True, blend=True, balanced_bce=True,
+                               eta=0.1, l1=1e-5),
+    # B2 orthogonality check: FedMLP with its BCE class-balanced.
+    "FedMLP-bal":   MethodSpec("FedMLP-bal", prior=True, fedmlp=True, eta=1.0, balanced_bce=True),
+    # Parameter-space control on top of balanced BCE (fixed mu=0.1 as in the paper's FedProx).
+    "FedProx-bal":  MethodSpec("FedProx-bal", prox=True, adaptive_mu=False, mu0=0.1,
+                               balanced_bce=True, excludes_stragglers=False),
 }
 
 
@@ -179,6 +204,50 @@ def _binary_kl(a, b, eps=1e-6):
     return a * torch.log(a / b) + (1 - a) * torch.log((1 - a) / (1 - b))
 
 
+def _reduce(per_entry, reduction):
+    return per_entry.mean() if reduction == "mean" else per_entry.sum(1).mean()
+
+
+def _focal_ml(logits, y, gamma=2.0, reduction="sum"):
+    """Multi-label focal BCE (Lin et al. 2017; symmetric, gamma=2). Reduction as in the
+    ASL/DB reference code: sum over classes, mean over the batch."""
+    bce = F.binary_cross_entropy_with_logits(logits, y, reduction="none")
+    p = torch.sigmoid(logits)
+    pt = p * y + (1 - p) * (1 - y)
+    return _reduce(((1 - pt) ** gamma) * bce, reduction)
+
+
+def _asl_ml(logits, y, gamma_pos=0.0, gamma_neg=4.0, clip=0.05, eps=1e-8, reduction="sum"):
+    """Asymmetric loss (Ridnik et al. 2021), reference defaults; class-sum/batch-mean."""
+    xs_pos = torch.sigmoid(logits)
+    xs_neg = 1.0 - xs_pos
+    if clip > 0:                                     # probability shifting of negatives
+        xs_neg = (xs_neg + clip).clamp(max=1.0)
+    los_pos = y * torch.log(xs_pos.clamp_min(eps))
+    los_neg = (1 - y) * torch.log(xs_neg.clamp_min(eps))
+    loss = los_pos + los_neg
+    pt = xs_pos * y + xs_neg * (1 - y)
+    gamma = gamma_pos * y + gamma_neg * (1 - y)
+    loss = loss * (1 - pt) ** gamma                  # asymmetric focusing
+    return -_reduce(loss, reduction)
+
+
+def _db_ml(logits, y, st, reduction="sum"):
+    """Distribution-balanced loss (Wu et al. 2020): re-balanced instance/class weighting
+    (alpha + sigmoid(beta*(r - mu))), negative-tolerant regularisation (class-specific bias
+    kappa*log(n_k/(N-n_k)) and negative logit scale lambda), and focal (gamma=2), following
+    the authors' ResampleLoss. Class frequencies are the client's local ones (the only
+    ones a federated client can see)."""
+    rep_rate = (y * st["freq_inv"]).sum(1, keepdim=True).clamp_min(1e-8)
+    w = st["alpha"] + torch.sigmoid(st["beta"] * (st["freq_inv"].unsqueeze(0) / rep_rate - st["mu"]))
+    z = logits + st["init_bias"]
+    z = z * (1 - y) * st["neg_scale"] + z * y
+    w = w / st["neg_scale"] * (1 - y) + w * y
+    bce = F.binary_cross_entropy_with_logits(z, y, reduction="none")
+    pt = torch.exp(-bce)
+    return _reduce(w * ((1 - pt) ** 2) * bce, reduction)
+
+
 def _augment_batch(xb):
     """Per-sample random horizontal flip + a (batch-shared) reflect-pad crop."""
     n, c, h, w = xb.shape
@@ -230,6 +299,19 @@ class LocalTrainer:
                 freq = counts / counts.sum().clamp_min(1)
             self.eta_vec = (spec.eta * (1.0 - freq)).to(self.device)
 
+        # local label statistics for the frequency-aware losses (WBCE, DB-loss)
+        self.pos_weight = self.db_stats = None
+        if cfg.multilabel and spec.loss in ("wbce", "db"):
+            n_k = self.y.sum(0)
+            N = float(self.num)
+            if spec.loss == "wbce":
+                self.pos_weight = ((N - n_k) / n_k.clamp_min(1.0)).clamp(1.0, 100.0)
+            else:
+                nk = n_k.clamp(1.0, max(N - 1.0, 1.0))
+                self.db_stats = dict(freq_inv=1.0 / nk,
+                                     init_bias=-torch.log(N / nk - 1.0) * 0.05,
+                                     neg_scale=2.0, alpha=0.1, beta=10.0, mu=0.2)
+
     def _num_classes(self):
         # last Linear out_features
         for m in reversed(list(self.net.modules())):
@@ -244,69 +326,68 @@ class LocalTrainer:
             return F.binary_cross_entropy_with_logits(logits, self.y).item()
         return F.cross_entropy(logits, self.y).item()
 
+    def _base_ml_loss(self, logits, y):
+        """Multi-label base loss on (hard or pseudo) labels ``y``: the *weighting axis*."""
+        kind = "bal" if self.spec.balanced_bce else self.spec.loss
+        if kind == "bce":                          # standard mean BCE over all entries (FedAvg)
+            return F.binary_cross_entropy_with_logits(logits, y)
+        if kind == "bal":                          # class-balanced: pos-mean + neg-mean (BalBCE)
+            bce_all = F.binary_cross_entropy_with_logits(logits, y, reduction="none")
+            return (bce_all * y).sum() / y.sum().clamp_min(1) \
+                + (bce_all * (1 - y)).sum() / (1 - y).sum().clamp_min(1)
+        if kind == "wbce":                         # per-class pos_weight = n_neg/n_pos (local)
+            return F.binary_cross_entropy_with_logits(logits, y, pos_weight=self.pos_weight)
+        if kind == "focal":
+            return _focal_ml(logits, y, reduction=self.spec.loss_reduction)
+        if kind == "asl":
+            return _asl_ml(logits, y, reduction=self.spec.loss_reduction)
+        if kind == "db":
+            return _db_ml(logits, y, self.db_stats, reduction=self.spec.loss_reduction)
+        raise ValueError(f"unknown multi-label loss '{self.spec.loss}'")
+
     def _batch_loss_ml(self, xb, yb):
-        """Multi-label (sigmoid/BCE) local loss."""
+        """Multi-label (sigmoid/BCE) local loss = base loss (weighting axis) + optional
+        output-space term toward the global teacher (distillation axis)."""
+        spec = self.spec
         logits = self.net(xb)                      # (B, C)
-        if self.spec.prior:
-            tg = torch.sigmoid(self.teacher(xb))   # teacher probs (B, C)
-            if self.spec.fedmlp:                   # FedMLP: pseudo-label + consistency
-                p = torch.sigmoid(logits)
-                y_aug = torch.maximum(yb, (tg > 0.8).float())   # tag confident classes
-                if self.spec.balanced_bce:         # B2 orthogonality: balance FedMLP's BCE
-                    bce_all = F.binary_cross_entropy_with_logits(
-                        logits, y_aug, reduction="none")
-                    bce_pos = (bce_all * y_aug).sum() / y_aug.sum().clamp_min(1)
-                    bce_neg = (bce_all * (1 - y_aug)).sum() / (1 - y_aug).sum().clamp_min(1)
-                    bce = bce_pos + bce_neg
-                else:
-                    bce = F.binary_cross_entropy_with_logits(logits, y_aug)
-                loss = bce + self.spec.eta * _binary_kl(tg, p).mean()
-                if self.spec.l1 > 0:
-                    loss = loss + self.spec.l1 * sum(p_.abs().sum()
-                                                     for p_ in self.params if p_.dim() > 1)
-                return loss
-            eta_c = (self.eta_vec if self.eta_vec is not None
-                     else torch.full((logits.shape[1],), self.spec.eta,
-                                     device=logits.device))
-            eta_c = eta_c.unsqueeze(0)             # (1, C)
-            if self.spec.balanced_bce or self.spec.neg_distill:   # 2x2 disentangling ablation
-                p = torch.sigmoid(logits)
-                bce_all = F.binary_cross_entropy_with_logits(logits, yb, reduction="none")
-                if self.spec.balanced_bce:         # pos/neg normalized apart (class-balanced)
-                    bce_pos = (bce_all * yb).sum() / yb.sum().clamp_min(1)
-                    bce_neg = (bce_all * (1 - yb)).sum() / (1 - yb).sum().clamp_min(1)
-                    loss = bce_pos + bce_neg
-                else:                              # standard mean BCE
-                    loss = bce_all.mean()
-                if self.spec.neg_distill:          # + per-class KL distillation of negatives
-                    loss = loss + (eta_c * _binary_kl(tg, p) * (1 - yb)).sum() \
-                        / (1 - yb).sum().clamp_min(1)
-                if self.spec.l1 > 0:
-                    loss = loss + self.spec.l1 * sum(p_.abs().sum()
-                                                     for p_ in self.params if p_.dim() > 1)
-                return loss
-            if self.spec.blend:                    # pLasso per-class response blend
-                target = (yb + eta_c * tg) / (1.0 + eta_c)
-                loss = F.binary_cross_entropy_with_logits(logits, target)
-            else:                                  # not-true: BCE on positives,
-                p = torch.sigmoid(logits)          # distill the negatives
-                bce_all = F.binary_cross_entropy_with_logits(logits, yb, reduction="none")
-                bce_pos = (bce_all * yb).sum() / yb.sum().clamp_min(1)
-                distill_neg = (eta_c * _binary_kl(tg, p) * (1 - yb)).sum() \
-                    / (1 - yb).sum().clamp_min(1)
-                if self.spec.nt_keep_bce:          # M4 control: RETAIN BCE on negatives
-                    bce_neg = (bce_all * (1 - yb)).sum() / (1 - yb).sum().clamp_min(1)
-                    loss = bce_pos + bce_neg + distill_neg
-                else:                              # standard not-true: no neg suppression
-                    loss = bce_pos + distill_neg
+        p = torch.sigmoid(logits)
+        tg = torch.sigmoid(self.teacher(xb)) if spec.prior else None   # teacher probs
+        eta_c = (self.eta_vec if self.eta_vec is not None
+                 else torch.full((logits.shape[1],), spec.eta,
+                                 device=logits.device)).unsqueeze(0)    # (1, C)
+        if spec.fedmlp:                            # FedMLP: pseudo-label + consistency
+            y_aug = torch.maximum(yb, (tg > 0.8).float())   # tag confident classes
+            loss = self._base_ml_loss(logits, y_aug) + spec.eta * _binary_kl(tg, p).mean()
+        elif spec.blend:                           # pLasso per-class response blend
+            target = (yb + eta_c * tg) / (1.0 + eta_c)
+            bce_all = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
+            if spec.balanced_bce:                  # FedPrior-bal: balance by the hard label
+                loss = (bce_all * yb).sum() / yb.sum().clamp_min(1) \
+                    + (bce_all * (1 - yb)).sum() / (1 - yb).sum().clamp_min(1)
+            else:
+                loss = bce_all.mean()
+        elif spec.not_true and not spec.nt_keep_bce:   # FedNTD port: BCE on positives only,
+            bce_all = F.binary_cross_entropy_with_logits(logits, yb, reduction="none")
+            bce_pos = (bce_all * yb).sum() / yb.sum().clamp_min(1)   # + distill the negatives
+            loss = bce_pos + (eta_c * _binary_kl(tg, p) * (1 - yb)).sum() \
+                / (1 - yb).sum().clamp_min(1)
         else:
-            loss = F.binary_cross_entropy_with_logits(logits, yb)
-        if self.spec.prox:
+            if spec.nt_keep_bce:                   # FedND (=FedNTD-BCE): balanced BCE + neg distill
+                bce_all = F.binary_cross_entropy_with_logits(logits, yb, reduction="none")
+                loss = (bce_all * yb).sum() / yb.sum().clamp_min(1) \
+                    + (bce_all * (1 - yb)).sum() / (1 - yb).sum().clamp_min(1)
+            else:
+                loss = self._base_ml_loss(logits, yb)
+            if spec.neg_distill or spec.nt_keep_bce:   # + per-class KL distillation of negatives
+                loss = loss + (eta_c * _binary_kl(tg, p) * (1 - yb)).sum() \
+                    / (1 - yb).sum().clamp_min(1)
+            if spec.full_distill:                  # + all-class KL toward the teacher (plain KD)
+                loss = loss + spec.eta * _binary_kl(tg, p).mean()
+        if spec.prox:
             loss = loss + 0.5 * self.mu * sum(
-                ((p - w0) ** 2).sum() for p, w0 in zip(self.params, self.w0))
-        if self.spec.l1 > 0:
-            loss = loss + self.spec.l1 * sum(p.abs().sum()
-                                             for p in self.params if p.dim() > 1)
+                ((q - w0) ** 2).sum() for q, w0 in zip(self.params, self.w0))
+        if spec.l1 > 0:
+            loss = loss + spec.l1 * sum(q.abs().sum() for q in self.params if q.dim() > 1)
         return loss
 
     def _batch_loss(self, xb, yb):

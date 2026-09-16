@@ -1,0 +1,7 @@
+[losses_ref_x voc0.5 s0] FedAvg@lr0.1           last10 mAP= 7.71 (3.1 min)
+[losses_ref_x voc0.5 s1] FedAvg@lr0.1           last10 mAP= 7.71 (2.9 min)
+[losses_ref_x voc0.5 s2] FedAvg@lr0.1           last10 mAP= 7.71 (2.6 min)
+[losses_ref_x coco0.5 s0] FedAvg@lr0.1           last10 mAP= 3.77 (1.7 min)
+[losses_ref_x coco0.5 s1] FedAvg@lr0.1           last10 mAP=22.42 (1.7 min)
+[losses_ref_x coco0.5 s2] FedAvg@lr0.1           last10 mAP= 3.77 (1.7 min)
+REVISION_GROUP_DONE losses_ref_x

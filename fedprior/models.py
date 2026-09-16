@@ -131,10 +131,15 @@ class PretrainedResNetML(nn.Module):
     ImageNet-normalized in ``data.py``.
     """
 
-    def __init__(self, num_classes=20):
+    def __init__(self, num_classes=20, arch="resnet18"):
         super().__init__()
-        from torchvision.models import resnet18, ResNet18_Weights
-        net = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
+        import torchvision.models as tvm
+        if arch == "resnet18":
+            net = tvm.resnet18(weights=tvm.ResNet18_Weights.IMAGENET1K_V1)
+        elif arch == "resnet50":
+            net = tvm.resnet50(weights=tvm.ResNet50_Weights.IMAGENET1K_V1)
+        else:
+            raise ValueError(arch)
         net.fc = nn.Linear(net.fc.in_features, num_classes)
         self.net = net
         self._freeze_bn()
@@ -157,6 +162,22 @@ class PretrainedResNetML(nn.Module):
         return self.net(x)
 
 
+class PretrainedConvNeXtML(nn.Module):
+    """ImageNet-pretrained ConvNeXt-Tiny (Liu et al. 2022) for multi-label FL: a second,
+    non-ResNet backbone family. ConvNeXt uses LayerNorm only (no batch statistics), so
+    every parameter is trainable and model averaging is well-defined without any freezing."""
+
+    def __init__(self, num_classes=20):
+        super().__init__()
+        from torchvision.models import convnext_tiny, ConvNeXt_Tiny_Weights
+        net = convnext_tiny(weights=ConvNeXt_Tiny_Weights.IMAGENET1K_V1)
+        net.classifier[2] = nn.Linear(net.classifier[2].in_features, num_classes)
+        self.net = net
+
+    def forward(self, x):
+        return self.net(x)
+
+
 def build_model(name: str, **kw) -> nn.Module:
     name = name.lower()
     if name == "linear":
@@ -166,6 +187,12 @@ def build_model(name: str, **kw) -> nn.Module:
     if name == "resnet_ml_pt":     # ImageNet-pretrained ResNet-18, frozen BN (multi-label)
         kw.setdefault("num_classes", 20)
         return PretrainedResNetML(**kw)
+    if name == "resnet50_ml_pt":   # ImageNet-pretrained ResNet-50, frozen BN (multi-label)
+        kw.setdefault("num_classes", 20)
+        return PretrainedResNetML(arch="resnet50", **kw)
+    if name == "convnext_ml_pt":   # ImageNet-pretrained ConvNeXt-Tiny (LayerNorm; second family)
+        kw.setdefault("num_classes", 20)
+        return PretrainedConvNeXtML(**kw)
     if name == "resnet":          # CIFAR-10 (stem='cifar', num_classes=10)
         return ResNetGN(stem="cifar", **kw)
     if name == "resnet_ml":       # multi-label (stem='imagenet', num_classes=20)

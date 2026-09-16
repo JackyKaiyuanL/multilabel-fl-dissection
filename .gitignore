@@ -1,0 +1,11 @@
+# datasets are never committed (see data/README.md)
+data/*
+!data/README.md
+# checkpoints and caches
+experiments/full/ckpt/
+*.pt
+*.pth
+__pycache__/
+*.pyc
+# generated tables / figure
+experiments/tables/

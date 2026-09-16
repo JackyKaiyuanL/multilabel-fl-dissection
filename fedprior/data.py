@@ -310,3 +310,66 @@ def build_voc_clients(num_clients=40, alpha=0.5, seed=0, root="./data", size=128
     global_client = Client(x_train, y_train)
     test_client = Client(x_test, y_test)
     return client_list, global_client, test_client
+
+
+# --------------------------------------------------------------------------- #
+# FLAIR (Song, Granqvist & Talwar, NeurIPS D&B 2022): real federated multi-label
+# --------------------------------------------------------------------------- #
+FLAIR_COARSE = ["animal", "art", "celebration", "equipment", "fire", "food", "games",
+                "interior_room", "light", "liquid", "material", "music", "outdoor",
+                "plant", "recreation", "religion", "structure"]      # 17 coarse labels
+
+
+def build_flair_clients(num_users=100, min_imgs=20, cap=150, n_test=5000, seed=0,
+                        root="./data", size=128):
+    """FLAIR with its *real* per-user partition (no synthetic Dirichlet split).
+
+    Clients = ``num_users`` Flickr users sampled (seed-dependent) from the train
+    partition among users holding >= ``min_imgs`` images, each contributing at most
+    ``cap`` images. Test = ``n_test`` images sampled once (fixed seed) from FLAIR's
+    held-out test users. Labels are the 17 coarse-grained classes (long-tailed:
+    ``structure`` ~229k vs ``religion`` ~0.9k images in the full set). Images are the
+    official 256x256 'small' release, resized to ``size``.
+    """
+    import json as _json
+    from PIL import Image
+    from torchvision import transforms
+    base = os.path.join(root, "flair")
+    meta = _json.load(open(os.path.join(base, "labels_and_metadata.json")))
+    img_dir = os.path.join(base, "small_images", "small_images")
+    idx = {c: i for i, c in enumerate(FLAIR_COARSE)}
+    by_user = {}
+    test_pool = []
+    for m in meta:
+        if m["partition"] == "train":
+            by_user.setdefault(m["user_id"], []).append(m)
+        elif m["partition"] == "test":
+            test_pool.append(m)
+    eligible = sorted(u for u, v in by_user.items() if len(v) >= min_imgs)
+    rng = np.random.default_rng(seed)
+    users = rng.choice(eligible, num_users, replace=False)
+    tf = transforms.Compose([transforms.Resize((size, size)), transforms.ToTensor(),
+                             transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))])
+
+    def _load(items):
+        xs, ys = [], []
+        for m in items:
+            img = Image.open(os.path.join(img_dir, m["image_id"] + ".jpg")).convert("RGB")
+            xs.append(tf(img))
+            y = torch.zeros(len(FLAIR_COARSE))
+            for l in m["labels"]:
+                y[idx[l]] = 1.0
+            ys.append(y)
+        return torch.stack(xs), torch.stack(ys)
+
+    client_list, tr_x, tr_y = [], [], []
+    for u in users:
+        items = by_user[u]
+        if len(items) > cap:
+            items = [items[i] for i in rng.choice(len(items), cap, replace=False)]
+        x, y = _load(items)
+        client_list.append(Client(x, y)); tr_x.append(x); tr_y.append(y)
+    rng_te = np.random.default_rng(123)                        # fixed test sample
+    te_items = [test_pool[i] for i in rng_te.choice(len(test_pool), n_test, replace=False)]
+    x_te, y_te = _load(te_items)
+    return client_list, Client(torch.cat(tr_x), torch.cat(tr_y)), Client(x_te, y_te)
